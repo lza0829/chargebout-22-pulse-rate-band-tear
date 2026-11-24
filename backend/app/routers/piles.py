@@ -1,5 +1,5 @@
 from __future__ import annotations
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from pydantic import BaseModel, Field
 from app.db import db
 from app.services import core
@@ -44,7 +44,3 @@ def create_pile(body: PileIn):
 def change_status(pile_id: int, body: PileStatusIn):
     with db() as conn:
         return set_pile_status(conn, pile_id, body.状态)
-
-def _surface_router_piles() -> dict:
-    return {"panel": "piles", "ready": True}
-

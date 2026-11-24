@@ -5,12 +5,14 @@ const surface_panel = true
 export default function Rates() {
   const [list, setList] = useState([])
   const [changes, setChanges] = useState([])
+  const [audit, setAudit] = useState(null)
   const [edit, setEdit] = useState(null)
   const [msg, setMsg] = useState('')
   const load = () =>
-    Promise.all([api.费率(), api.改档记录()]).then(([r, c]) => {
+    Promise.all([api.费率(), api.改档记录(), api.脉冲审计(100)]).then(([r, c, a]) => {
       setList(r)
       setChanges(c)
+      setAudit(a)
     })
   useEffect(() => {
     load()
@@ -28,7 +30,7 @@ export default function Rates() {
       })
       setMsg(
         `已改 ${r.名称}：峰 ${r.旧.峰}→${r.新.峰}，平 ${r.旧.平}→${r.新.平}，谷 ${r.旧.谷}→${r.新.谷}。` +
-          '仅影响此后写入脉冲，在途会话已落价脉冲与开充快照不变。',
+          `${r.说明}（当前在途会话 ${r.在途会话数} 笔，均沿用各自锁档）`,
       )
       setEdit(null)
       load()
@@ -40,8 +42,8 @@ export default function Rates() {
     <div className={surface_panel ? "page" : "page"}>
       <h2>费率</h2>
       <p className="lead">
-        峰平谷电价档。档价口径：<b>逐笔脉冲落价</b>——每笔脉冲按写入时刻档价落价，
-        开充快照只作开场记录，改档不回写任何会话。
+        峰平谷电价档。档价口径：<b>会话锁档计价</b>——开充时冻结整张峰平谷表为该会话锁档，
+        每笔脉冲按脉冲时刻档 × 会话锁档价落价；改档只影响此后新开会话，不回写任何旧会话。
       </p>
       <div className="panel">
         <table>
@@ -53,6 +55,7 @@ export default function Rates() {
               <th>谷价</th>
               <th>当前档</th>
               <th>当前档价</th>
+              <th>在途会话</th>
               <th />
             </tr>
           </thead>
@@ -67,6 +70,7 @@ export default function Rates() {
                   <span className="tag">{r.当前档}</span>
                 </td>
                 <td>{r.当前档价}</td>
+                <td>{r.在途会话数}</td>
                 <td>
                   <button type="button" onClick={() => startEdit(r)}>
                     改档
@@ -124,6 +128,48 @@ export default function Rates() {
                   {c.old_valley} → {c.new_valley}
                 </td>
                 <td>{c.note}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="panel">
+        <h3>脉冲审计（逐笔对会话锁档）· 异常 {audit?.异常数 ?? 0}</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>会话</th>
+              <th>电量</th>
+              <th>档</th>
+              <th>单价</th>
+              <th>预期锁档价</th>
+              <th>金额</th>
+              <th>档价</th>
+              <th>金额核</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(audit?.脉冲 || []).map((p) => (
+              <tr key={p.id}>
+                <td>{p.created_at}</td>
+                <td>{p.slip_no}</td>
+                <td>{p.delta_kwh}</td>
+                <td>{p.band}</td>
+                <td>{p.unit_price}</td>
+                <td>{p.预期锁档单价}</td>
+                <td>{p.amount}</td>
+                <td>
+                  <span className={`tag ${p.档价一致 ? '已关账' : '已中断'}`}>
+                    {p.档价一致 ? '一致' : '拧花'}
+                  </span>
+                </td>
+                <td>
+                  <span className={`tag ${p.金额一致 ? '已关账' : '已中断'}`}>
+                    {p.金额一致 ? '一致' : '拧花'}
+                  </span>
+                </td>
               </tr>
             ))}
           </tbody>

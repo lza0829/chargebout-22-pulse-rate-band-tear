@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import HTTPException
 
+from app.bands import PRICE_MODE
 from app.services.core import now_str
 
 
@@ -15,9 +16,8 @@ def _get_plan(conn, rate_plan_id: int):
 def update_rate(conn, rate_plan_id: int, peak: float, flat: float, valley: float, note: str = "") -> dict:
     """改档写口：整表峰平谷同事务改写 + 记一条审计事件。
 
-    只改费率表本身；绝不回写任何会话的 price_locked / opening_band，
-    也绝不重算任何已落价脉冲——已写脉冲的金额是既成事实。
-    在途会话的后续脉冲会按新表当时档价落价，预估随脉冲自然累进。
+    只改费率表本身；绝不回写任何会话锁档或已落价脉冲——已写脉冲的金额是既成事实。
+    在途会话沿用各自锁档，新开会话才按新表冻结锁档。
     """
     for label, v in (("峰价", peak), ("平价", flat), ("谷价", valley)):
         if v < 0:
@@ -36,11 +36,19 @@ def update_rate(conn, rate_plan_id: int, peak: float, flat: float, valley: float
            VALUES(?,?,?,?,?,?,?,?,?)""",
         (rate_plan_id, old[0], old[1], old[2], new[0], new[1], new[2], ts, note),
     )
+    in_flight = conn.execute(
+        "SELECT COUNT(*) AS n FROM sessions WHERE rate_plan_id=? AND status IN ('充电中','结算中')",
+        (rate_plan_id,),
+    ).fetchone()["n"]
     return {
         "费率编号": rate_plan_id,
         "名称": plan["name"],
         "旧": {"峰": old[0], "平": old[1], "谷": old[2]},
         "新": {"峰": new[0], "平": new[1], "谷": new[2]},
         "改档时间": ts,
-        "说明": "仅影响此后写入的脉冲；已落价脉冲与会话开充快照均不变。",
+        "在途会话数": in_flight,
+        "说明": (
+            f"档价口径 {PRICE_MODE}：在途会话沿用各自锁档，已落价脉冲不变；"
+            "仅此后新开会话按新表冻结锁档。"
+        ),
     }

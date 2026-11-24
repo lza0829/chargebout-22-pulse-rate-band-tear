@@ -2,6 +2,17 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from app.config import DB_PATH
+from app.bands import (
+    BAND_COLUMN,
+    BAND_FLAT,
+    BAND_LOCK_COLUMN,
+    BAND_ORDER,
+    BAND_PEAK,
+    BAND_VALLEY,
+    PRICE_MODE,
+    band_for,
+    parse_dt,
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sites (
@@ -50,7 +61,12 @@ CREATE TABLE IF NOT EXISTS sessions (
   amount REAL NOT NULL DEFAULT 0,
   price_locked REAL,
   opening_band TEXT,
-  price_mode TEXT NOT NULL DEFAULT '逐笔脉冲落价',
+  price_mode TEXT NOT NULL DEFAULT '会话锁档计价',
+  locked_peak REAL,
+  locked_flat REAL,
+  locked_valley REAL,
+  lock_at TEXT,
+  pricing_state TEXT NOT NULL DEFAULT '锁档一致',
   started_at TEXT NOT NULL,
   closed_at TEXT,
   note TEXT NOT NULL DEFAULT '',
@@ -139,44 +155,128 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """为旧库补列；新建库由 SCHEMA 直接建好。"""
+    """为旧库补列；新建库由 SCHEMA 直接建好。
+
+    锁档迁移一律从「会话自身证据」回填，绝不按当前费率表现价伪造锁档——
+    否则改档后旧会话会被漂价。历史脉冲若从未落价，也按其所属档的会话锁档落价，
+    使脉冲行档价与累计金额恒可重放。
+    """
     sess_cols = _columns(conn, "sessions")
+    added_lock = False
+    for col in ("locked_peak", "locked_flat", "locked_valley", "lock_at"):
+        if col not in sess_cols:
+            conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} REAL" if col != "lock_at" else "ALTER TABLE sessions ADD COLUMN lock_at TEXT")
+            added_lock = True
+    if "pricing_state" not in sess_cols:
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN pricing_state TEXT NOT NULL DEFAULT '锁档一致'"
+        )
     if "opening_band" not in sess_cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN opening_band TEXT")
     if "price_mode" not in sess_cols:
-        conn.execute("ALTER TABLE sessions ADD COLUMN price_mode TEXT NOT NULL DEFAULT '逐笔脉冲落价'")
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN price_mode TEXT NOT NULL DEFAULT '会话锁档计价'"
+        )
 
     pulse_cols = _columns(conn, "pulses")
-    if "unit_price" not in pulse_cols:
-        conn.execute("ALTER TABLE pulses ADD COLUMN unit_price REAL")
-    if "band" not in pulse_cols:
-        conn.execute("ALTER TABLE pulses ADD COLUMN band TEXT")
-    if "amount" not in pulse_cols:
-        conn.execute("ALTER TABLE pulses ADD COLUMN amount REAL")
-    if "rate_plan_id" not in pulse_cols:
-        conn.execute("ALTER TABLE pulses ADD COLUMN rate_plan_id INTEGER")
+    for col, decl in (
+        ("unit_price", "REAL"),
+        ("band", "TEXT"),
+        ("amount", "REAL"),
+        ("rate_plan_id", "INTEGER"),
+    ):
+        if col not in pulse_cols:
+            conn.execute(f"ALTER TABLE pulses ADD COLUMN {col} {decl}")
 
-    # 旧脉冲没有落价：按会话开充快照价回填，使历史脉冲仍可逐笔重放。
+    # 为缺锁档的旧会话补锁：优先按既有脉冲证据反推每档单价；
+    # 否则用开充快照价 + 该档位费率列回填（仍是会话开充时点的价，非当前表）。
+    if added_lock:
+        plans = {
+            r["id"]: r for r in conn.execute("SELECT * FROM rate_plans").fetchall()
+        }
+        sessions = conn.execute("SELECT * FROM sessions").fetchall()
+        for se in sessions:
+            plan = plans.get(se["rate_plan_id"])
+            lock: dict[str, float] = {}
+            evidence = conn.execute(
+                """SELECT band, unit_price FROM pulses
+                   WHERE session_id=? AND band IS NOT NULL AND unit_price IS NOT NULL
+                   GROUP BY band""",
+                (se["id"],),
+            ).fetchall()
+            for e in evidence:
+                if e["band"] in BAND_COLUMN:
+                    lock[e["band"]] = float(e["unit_price"])
+            for band in BAND_ORDER:
+                if band in lock:
+                    continue
+                if plan is not None:
+                    lock[band] = float(plan[BAND_COLUMN[band]])
+                elif se["price_locked"] is not None:
+                    lock[band] = float(se["price_locked"])
+                else:
+                    lock[band] = 0.0
+            conn.execute(
+                "UPDATE sessions SET locked_peak=?, locked_flat=?, locked_valley=?, "
+                "lock_at=COALESCE(lock_at, started_at) WHERE id=?",
+                (lock[BAND_PEAK], lock[BAND_FLAT], lock[BAND_VALLEY], se["id"]),
+            )
+
+    # 旧脉冲没有落价：按其所属档的会话锁档落价，保证仍可逐笔重放。
     legacy = conn.execute(
-        """SELECT p.id, p.delta_kwh, s.price_locked, s.rate_plan_id
+        """SELECT p.id AS pulse_id, p.delta_kwh AS delta_kwh, p.band AS band,
+                  p.created_at AS created_at,
+                  s.price_locked AS price_locked, s.opening_band AS opening_band,
+                  s.rate_plan_id AS rate_plan_id,
+                  s.locked_peak AS locked_peak, s.locked_flat AS locked_flat,
+                  s.locked_valley AS locked_valley
            FROM pulses p JOIN sessions s ON s.id=p.session_id
            WHERE p.unit_price IS NULL"""
     ).fetchall()
     for r in legacy:
-        price = float(r["price_locked"] or 0.0)
+        band = r["band"]
+        if band not in BAND_ORDER:
+            band = _band_for_ts(r["created_at"]) or r["opening_band"] or BAND_FLAT
+        price = r[BAND_LOCK_COLUMN[band]]
+        price = float(price) if price is not None else float(r["price_locked"] or 0.0)
         conn.execute(
-            "UPDATE pulses SET unit_price=?, amount=?, rate_plan_id=? WHERE id=?",
-            (price, round(float(r["delta_kwh"]) * price, 2), r["rate_plan_id"], r["id"]),
+            "UPDATE pulses SET unit_price=?, band=?, amount=?, rate_plan_id=? WHERE id=?",
+            (
+                price,
+                band,
+                round(float(r["delta_kwh"]) * price, 2),
+                r["rate_plan_id"],
+                r["pulse_id"],
+            ),
         )
-    # 在途会话的累计金额改为脉冲金额之和，保证「预估可由脉冲重放」。
+
+    # 在途会话的累计电量/金额改为脉冲合计，保证「预估可由脉冲重放」。
     open_ids = conn.execute(
         "SELECT id FROM sessions WHERE status IN ('充电中','结算中')"
     ).fetchall()
     for r in open_ids:
-        total = conn.execute(
-            "SELECT COALESCE(SUM(amount),0) AS a FROM pulses WHERE session_id=?", (r["id"],)
-        ).fetchone()["a"]
-        conn.execute("UPDATE sessions SET amount=? WHERE id=?", (round(float(total), 2), r["id"]))
+        agg = conn.execute(
+            "SELECT COALESCE(SUM(amount),0) AS a, COALESCE(SUM(delta_kwh),0) AS k "
+            "FROM pulses WHERE session_id=?",
+            (r["id"],),
+        ).fetchone()
+        conn.execute(
+            "UPDATE sessions SET amount=?, kwh=? WHERE id=?",
+            (round(float(agg["a"]), 2), round(float(agg["k"]), 3), r["id"]),
+        )
+
+    # 旧库 price_mode 字面值归一到当前口径。
+    conn.execute(
+        "UPDATE sessions SET price_mode=? WHERE price_mode!='会话锁档计价' OR price_mode IS NULL",
+        (PRICE_MODE,),
+    )
+    # 清理历史「假亮」缓存：surface_last/表面计数一律不再作为读数来源。
+    conn.execute("DELETE FROM settings WHERE key='surface_last' OR key='surface_ok'")
+
+
+def _band_for_ts(value: str | None) -> str | None:
+    dt = parse_dt(value)
+    return band_for(dt) if dt else None
 
 
 def init_db() -> None:

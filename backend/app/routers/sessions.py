@@ -83,6 +83,21 @@ def abort(session_id: int, body: AbortIn | None = None):
         reason = body.原因 if body else "急停"
         return svc.abort_session(conn, session_id, reason)
 
-def _surface_router_sessions() -> dict:
-    return {"panel": "sessions", "ready": True}
+
+@router.post("/会话/{session_id}/对账")
+def reconcile(session_id: int):
+    with db() as conn:
+        return svc.reconcile_session(conn, session_id)
+
+
+@router.get("/对账")
+def reconcile_all():
+    with db() as conn:
+        return core.reconcile_all(conn)
+
+
+@router.get("/脉冲审计")
+def pulse_audit(limit: int = 200):
+    with db() as conn:
+        return core.pulse_audit(conn, limit)
 
